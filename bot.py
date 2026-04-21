@@ -99,7 +99,6 @@ def get_available_times(date):
 def get_user_booking(user_id):
     conn = get_db()
     cur = conn.cursor()
-    now = datetime.now()
     cur.execute("""
         SELECT * FROM bookings
         WHERE user_id = ? AND status = 'active'
@@ -109,7 +108,7 @@ def get_user_booking(user_id):
     conn.close()
     if row:
         slot_dt = datetime.strptime(f"{row['date']} {row['time']}", "%Y-%m-%d %H:%M")
-        if slot_dt < now:
+        if slot_dt < datetime.now():
             complete_old_bookings()
             return None
     return row
@@ -167,7 +166,7 @@ async def send_reminder(app, user_id, time_str):
     try:
         await app.bot.send_message(
             chat_id=user_id,
-            text=f"🔔 Нагадування!\n\nВи записані на завтра о {time_str}.\nЧекаємо на вас! ❤️"
+            text=f"🔔 Нагадування!\n\nВи записані завтра о {time_str}.\nЧекаємо на вас! ❤️"
         )
     except Exception as e:
         logging.error(f"Reminder error: {e}")
@@ -182,8 +181,7 @@ def main_menu():
 
 def admin_menu():
     keyboard = [
-        [KeyboardButton("➕ Додати день")],
-        [KeyboardButton("➕ Додати слот")],
+        [KeyboardButton("➕ Додати день"), KeyboardButton("➕ Додати слот")],
         [KeyboardButton("🔒 Закрити день"), KeyboardButton("🔓 Відкрити день")],
         [KeyboardButton("📅 Розклад на дату")],
         [KeyboardButton("📋 Майбутні записи")],
@@ -198,9 +196,11 @@ def cancel_menu():
 
 def dates_keyboard(dates):
     keyboard = []
+    days_ua = {"Mon": "Пн", "Tue": "Вт", "Wed": "Ср", "Thu": "Чт", "Fri": "Пт", "Sat": "Сб", "Sun": "Нд"}
     for date in dates:
         dt = datetime.strptime(date, "%Y-%m-%d")
-        label = dt.strftime("%d.%m.%Y (%a)").replace("Mon", "Пн").replace("Tue", "Вт").replace("Wed", "Ср").replace("Thu", "Чт").replace("Fri", "Пт").replace("Sat", "Сб").replace("Sun", "Нд")
+        day = days_ua.get(dt.strftime("%a"), dt.strftime("%a"))
+        label = f"{dt.strftime('%d.%m.%Y')} ({day})"
         keyboard.append([InlineKeyboardButton(label, callback_data=f"date_{date}")])
     keyboard.append([InlineKeyboardButton("❌ Скасувати", callback_data="cancel_booking")])
     return InlineKeyboardMarkup(keyboard)
@@ -215,15 +215,12 @@ def times_keyboard(date, times):
             row = []
     if row:
         keyboard.append(row)
-    keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="back_to_dates")])
+    keyboard.append([InlineKeyboardButton("◀️ Назад до дат", callback_data="back_to_dates")])
     return InlineKeyboardMarkup(keyboard)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.message.from_user.id
-    if uid == ADMIN_ID:
-        context.user_data["admin_mode"] = False
     await update.message.reply_text(
-        "👋 Привіт! Я допоможу записатись до майстра.\n\nОбери дію 👇",
+        "👋 Привіт! Я допоможу записатись до майстра манікюру.\n\nОбери дію 👇",
         reply_markup=main_menu()
     )
     return ConversationHandler.END
@@ -233,7 +230,25 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Немає доступу.")
         return
     context.user_data["admin_mode"] = True
-    await update.message.reply_text("🔐 Адмін панель:", reply_markup=admin_menu())
+    await update.message.reply_text(
+        "🔐 <b>Адмін панель</b>\n\n"
+        "➕ <b>Додати день</b> — додай робочий день\n"
+        "Формат: <code>2026-05-01</code>\n\n"
+        "➕ <b>Додати слот</b> — додай час прийому\n"
+        "Формат: <code>2026-05-01 10:00</code>\n\n"
+        "🔒 <b>Закрити день</b> — заблокуй день повністю\n"
+        "Клієнти не зможуть записатись на цей день\n\n"
+        "🔓 <b>Відкрити день</b> — розблокуй закритий день\n\n"
+        "📅 <b>Розклад на дату</b> — переглянь слоти\n"
+        "🟢 вільний | 🔴 зайнятий\n\n"
+        "📋 <b>Майбутні записи</b> — всі активні записи\n"
+        "Тут видно ID для скасування\n\n"
+        "❌ <b>Скасувати запис</b> — введи ID запису\n"
+        "Клієнт отримає повідомлення про скасування\n\n"
+        "Обери дію 👇",
+        parse_mode="HTML",
+        reply_markup=admin_menu()
+    )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -249,28 +264,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif text == "➕ Додати день":
             await update.message.reply_text(
-                "Введи дату у форматі РРРР-ММ-ДД\nНаприклад: 2026-05-01",
+                "📅 <b>Додати робочий день</b>\n\n"
+                "Введи дату у форматі:\n"
+                "<code>РРРР-ММ-ДД</code>\n\n"
+                "Наприклад: <code>2026-05-01</code>",
+                parse_mode="HTML",
                 reply_markup=cancel_menu()
             )
             return WAITING_ADMIN_DATE
 
         elif text == "➕ Додати слот":
             await update.message.reply_text(
-                "Введи дату і час у форматі РРРР-ММ-ДД ГГ:ХХ\nНаприклад: 2026-05-01 10:00",
+                "🕐 <b>Додати слот часу</b>\n\n"
+                "Введи дату і час у форматі:\n"
+                "<code>РРРР-ММ-ДД ГГ:ХХ</code>\n\n"
+                "Наприклад: <code>2026-05-01 10:00</code>\n\n"
+                "💡 Якщо день ще не створений — він створюється автоматично",
+                parse_mode="HTML",
                 reply_markup=cancel_menu()
             )
             return WAITING_ADMIN_TIME
 
         elif text == "🔒 Закрити день":
             await update.message.reply_text(
-                "Введи дату для закриття (РРРР-ММ-ДД):",
+                "🔒 <b>Закрити день</b>\n\n"
+                "Введи дату яку хочеш закрити:\n"
+                "<code>РРРР-ММ-ДД</code>\n\n"
+                "Наприклад: <code>2026-05-01</code>\n\n"
+                "⚠️ Клієнти не зможуть бачити слоти цього дня",
+                parse_mode="HTML",
                 reply_markup=cancel_menu()
             )
             return WAITING_ADMIN_CLOSE_DATE
 
         elif text == "🔓 Відкрити день":
             await update.message.reply_text(
-                "Введи дату для відкриття (РРРР-ММ-ДД):",
+                "🔓 <b>Відкрити день</b>\n\n"
+                "Введи дату яку хочеш відкрити:\n"
+                "<code>РРРР-ММ-ДД</code>\n\n"
+                "Наприклад: <code>2026-05-01</code>",
+                parse_mode="HTML",
                 reply_markup=cancel_menu()
             )
             context.user_data["open_day"] = True
@@ -278,7 +311,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif text == "📅 Розклад на дату":
             await update.message.reply_text(
-                "Введи дату (РРРР-ММ-ДД):",
+                "📅 <b>Розклад на дату</b>\n\n"
+                "Введи дату для перегляду:\n"
+                "<code>РРРР-ММ-ДД</code>\n\n"
+                "🟢 — вільний слот\n"
+                "🔴 — зайнятий (ім'я і телефон клієнта)",
+                parse_mode="HTML",
                 reply_markup=cancel_menu()
             )
             context.user_data["view_schedule"] = True
@@ -289,7 +327,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cur = conn.cursor()
             today = str(datetime.now().date())
             cur.execute("""
-                SELECT b.id, b.date, b.time, b.name, b.phone, b.user_id
+                SELECT b.id, b.date, b.time, b.name, b.phone
                 FROM bookings b
                 WHERE b.status = 'active' AND b.date >= ?
                 ORDER BY b.date, b.time
@@ -299,17 +337,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if rows:
                 lines = []
                 for r in rows:
-                    lines.append(f"#{r['id']} | {r['date']} {r['time']} | {r['name']} | {r['phone']}")
+                    dt = datetime.strptime(f"{r['date']} {r['time']}", "%Y-%m-%d %H:%M")
+                    lines.append(f"#{r['id']} | {dt.strftime('%d.%m %H:%M')} | {r['name']} | {r['phone']}")
                 await update.message.reply_text(
-                    "📋 Майбутні записи:\n\n" + "\n".join(lines),
+                    "📋 <b>Майбутні записи:</b>\n\n" + "\n".join(lines) +
+                    "\n\n💡 ID використовуй для скасування запису",
+                    parse_mode="HTML",
                     reply_markup=admin_menu()
                 )
             else:
-                await update.message.reply_text("Записів немає.", reply_markup=admin_menu())
+                await update.message.reply_text("Активних записів немає.", reply_markup=admin_menu())
 
         elif text == "❌ Скасувати запис клієнта":
             await update.message.reply_text(
-                "Введи ID запису (число):",
+                "❌ <b>Скасувати запис клієнта</b>\n\n"
+                "Введи ID запису (число).\n"
+                "ID можна знайти в розділі 📋 Майбутні записи\n\n"
+                "Клієнт автоматично отримає повідомлення про скасування",
+                parse_mode="HTML",
                 reply_markup=cancel_menu()
             )
             return WAITING_ADMIN_CANCEL_ID
@@ -332,13 +377,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         dates = get_available_dates()
         if not dates:
-            await update.message.reply_text("На жаль, вільних дат немає. Спробуй пізніше.", reply_markup=main_menu())
+            await update.message.reply_text(
+                "На жаль, вільних дат немає 😔\nСпробуй пізніше.",
+                reply_markup=main_menu()
+            )
             return ConversationHandler.END
 
-        await update.message.reply_text(
-            "Вибери дату:",
-            reply_markup=dates_keyboard(dates)
-        )
+        await update.message.reply_text("📅 Вибери зручну дату:", reply_markup=dates_keyboard(dates))
 
     elif text == "📋 Мій запис":
         booking = get_user_booking(uid)
@@ -348,33 +393,54 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("❌ Скасувати запис", callback_data=f"cancel_{booking['id']}")]
             ])
             await update.message.reply_text(
-                f"📋 Твій запис:\n\n"
+                f"📋 <b>Твій запис:</b>\n\n"
                 f"📅 Дата: {dt.strftime('%d.%m.%Y')}\n"
                 f"🕐 Час: {booking['time']}\n"
                 f"👤 Ім'я: {booking['name']}\n"
                 f"📞 Телефон: {booking['phone']}",
+                parse_mode="HTML",
                 reply_markup=keyboard
             )
         else:
-            await update.message.reply_text("У тебе немає активних записів.", reply_markup=main_menu())
+            await update.message.reply_text(
+                "У тебе немає активних записів.\n\nЗапишись через '📅 Записатись' 👇",
+                reply_markup=main_menu()
+            )
 
     elif text == "💅 Прайси":
         await update.message.reply_text(
-            "<b>💅 Прайси:</b>\n\n"
-            "Манікюр — 500₴\n"
-            "Педикюр — 600₴\n"
-            "Нарощування — 800₴\n"
-            "Корекція — 400₴",
+            "💅 <b>Прайс-лист</b>\n\n"
+            "<b>Манікюр</b>\n"
+            "• Класичний манікюр — 350₴\n"
+            "• Апаратний манікюр — 400₴\n"
+            "• Манікюр + гель-лак — 550₴\n"
+            "• Зняття гель-лаку — 100₴\n\n"
+            "<b>Педикюр</b>\n"
+            "• Класичний педикюр — 500₴\n"
+            "• Апаратний педикюр — 550₴\n"
+            "• Педикюр + гель-лак — 700₴\n\n"
+            "<b>Нарощування</b>\n"
+            "• Нарощування на форми — 900₴\n"
+            "• Нарощування на типси — 850₴\n"
+            "• Корекція нарощування — 600₴\n"
+            "• Зняття нарощування — 200₴\n\n"
+            "<b>Дизайн</b>\n"
+            "• Стемпінг — від 50₴\n"
+            "• Втирка / кошачій eye — від 80₴\n"
+            "• Розпис (1 палець) — від 100₴\n"
+            "• Складний дизайн — від 200₴\n\n"
+            "💬 Точну ціну уточнюй у майстра",
             parse_mode="HTML",
             reply_markup=main_menu()
         )
 
     elif text == "🖼 Портфоліо":
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Дивитись портфоліо 🖼", url="https://ru.pinterest.com/crystalwithluv/_created/")]
+            [InlineKeyboardButton("Instagram 📸", url="https://www.instagram.com/barabika.nails?igsh=MXFhZGRyY2d1M2M0cg==")],
+            [InlineKeyboardButton("Pinterest 🖼", url="https://ru.pinterest.com/crystalwithluv/_created/")]
         ])
         await update.message.reply_text(
-            "Ось наше портфоліо 👇",
+            "✨ Наші роботи — дивись в соцмережах 👇",
             reply_markup=keyboard
         )
 
@@ -387,26 +453,32 @@ async def booking_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = query.from_user.id
 
     if data == "cancel_booking":
-        await query.edit_message_text("Скасовано.")
+        await query.edit_message_text("Скасовано. Повертайся коли зручно! 😊")
         return ConversationHandler.END
 
     elif data == "back_to_dates":
         dates = get_available_dates()
         if dates:
-            await query.edit_message_text("Вибери дату:", reply_markup=dates_keyboard(dates))
+            await query.edit_message_text("📅 Вибери зручну дату:", reply_markup=dates_keyboard(dates))
         else:
-            await query.edit_message_text("Вільних дат немає.")
+            await query.edit_message_text("Вільних дат немає 😔")
 
     elif data.startswith("date_"):
         date = data.replace("date_", "")
         context.user_data["booking_date"] = date
         times = get_available_times(date)
         if not times:
-            await query.edit_message_text("На цю дату немає вільних слотів.", reply_markup=dates_keyboard(get_available_dates()))
+            dates = get_available_dates()
+            await query.edit_message_text(
+                "На цю дату немає вільних слотів 😔\nВибери іншу дату:",
+                reply_markup=dates_keyboard(dates)
+            )
             return
         dt = datetime.strptime(date, "%Y-%m-%d")
+        days_ua = {"Mon": "Пн", "Tue": "Вт", "Wed": "Ср", "Thu": "Чт", "Fri": "Пт", "Sat": "Сб", "Sun": "Нд"}
+        day = days_ua.get(dt.strftime("%a"), dt.strftime("%a"))
         await query.edit_message_text(
-            f"📅 {dt.strftime('%d.%m.%Y')}\n\nВибери час:",
+            f"📅 {dt.strftime('%d.%m.%Y')} ({day})\n\n🕐 Вибери зручний час:",
             reply_markup=times_keyboard(date, times)
         )
 
@@ -416,8 +488,10 @@ async def booking_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         time_str = parts[2]
         context.user_data["booking_date"] = date
         context.user_data["booking_time"] = time_str
+        dt = datetime.strptime(date, "%Y-%m-%d")
         await query.edit_message_text(
-            f"📅 {datetime.strptime(date, '%Y-%m-%d').strftime('%d.%m.%Y')} о {time_str}\n\nВведи своє ім'я:"
+            f"📅 {dt.strftime('%d.%m.%Y')} о {time_str}\n\n"
+            f"👤 Введи своє ім'я:"
         )
         return WAITING_NAME
 
@@ -427,10 +501,13 @@ async def booking_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("✅ Так, скасувати", callback_data=f"confirm_cancel_{booking_id}")],
             [InlineKeyboardButton("◀️ Ні, залишити", callback_data="keep_booking")],
         ])
-        await query.edit_message_text("Ти впевнений що хочеш скасувати запис?", reply_markup=keyboard)
+        await query.edit_message_text(
+            "⚠️ Ти впевнений що хочеш скасувати запис?\n\nЦю дію не можна відмінити.",
+            reply_markup=keyboard
+        )
 
     elif data == "keep_booking":
-        await query.edit_message_text("Запис збережено ✅")
+        await query.edit_message_text("✅ Запис збережено! Чекаємо на тебе ❤️")
 
     elif data.startswith("confirm_cancel_"):
         booking_id = int(data.replace("confirm_cancel_", ""))
@@ -446,13 +523,13 @@ async def booking_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if scheduler.get_job(job_id):
                 scheduler.remove_job(job_id)
 
-            await query.edit_message_text("✅ Запис скасовано.")
+            await query.edit_message_text("✅ Запис скасовано.\n\nБудемо раді бачити тебе знову! 😊")
 
             try:
                 await context.bot.send_message(
                     chat_id=ADMIN_ID,
                     text=f"❌ Клієнт скасував запис!\n\n"
-                         f"#{booking_id} | {booking['date']} {booking['time']}\n"
+                         f"#{booking['id']} | {booking['date']} {booking['time']}\n"
                          f"👤 {booking['name']} | 📞 {booking['phone']}"
                 )
             except:
@@ -466,7 +543,10 @@ async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Скасовано.", reply_markup=main_menu())
         return ConversationHandler.END
     context.user_data["booking_name"] = text
-    await update.message.reply_text("Введи номер телефону:", reply_markup=cancel_menu())
+    await update.message.reply_text(
+        f"👤 Ім'я: {text}\n\n📞 Тепер введи номер телефону:",
+        reply_markup=cancel_menu()
+    )
     return WAITING_PHONE
 
 async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -481,7 +561,6 @@ async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = context.user_data.get("booking_name")
     phone = text
 
-    # Перевірка чи слот ще вільний
     conn = get_db()
     cur = conn.cursor()
     cur.execute("SELECT is_booked FROM time_slots WHERE date = ? AND time = ?", (date, time_str))
@@ -490,7 +569,7 @@ async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not slot or slot["is_booked"]:
         await update.message.reply_text(
-            "❌ На жаль цей слот вже зайнятий. Спробуй вибрати інший час.",
+            "❌ На жаль цей слот вже зайнятий 😔\n\nВибери інший час:",
             reply_markup=main_menu()
         )
         return ConversationHandler.END
@@ -499,26 +578,29 @@ async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dt = datetime.strptime(f"{date} {time_str}", "%Y-%m-%d %H:%M")
 
     schedule_reminder(context.application, booking_id, uid, date, time_str)
-
     context.user_data.clear()
 
     await update.message.reply_text(
-        f"✅ Запис підтверджено!\n\n"
+        f"✅ <b>Запис підтверджено!</b>\n\n"
         f"📅 Дата: {dt.strftime('%d.%m.%Y')}\n"
         f"🕐 Час: {time_str}\n"
         f"👤 Ім'я: {name}\n"
         f"📞 Телефон: {phone}\n\n"
+        f"За 24 години до візиту надішлемо нагадування 🔔\n\n"
         f"Чекаємо на тебе! ❤️",
+        parse_mode="HTML",
         reply_markup=main_menu()
     )
 
     try:
         await context.bot.send_message(
             chat_id=ADMIN_ID,
-            text=f"🆕 Новий запис!\n\n"
-                 f"#{booking_id} | {date} {time_str}\n"
-                 f"👤 {name} | 📞 {phone}\n"
-                 f"Telegram ID: {uid}"
+            text=f"🆕 <b>Новий запис!</b>\n\n"
+                 f"#{booking_id} | {dt.strftime('%d.%m.%Y')} о {time_str}\n"
+                 f"👤 {name}\n"
+                 f"📞 {phone}\n"
+                 f"Telegram ID: {uid}",
+            parse_mode="HTML"
         )
     except:
         pass
@@ -539,7 +621,11 @@ async def admin_add_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
         await update.message.reply_text(f"✅ День {text} додано!", reply_markup=admin_menu())
     except ValueError:
-        await update.message.reply_text("❌ Невірний формат. Введи РРРР-ММ-ДД:", reply_markup=cancel_menu())
+        await update.message.reply_text(
+            "❌ Невірний формат.\nВведи дату як <code>РРРР-ММ-ДД</code>:",
+            parse_mode="HTML",
+            reply_markup=cancel_menu()
+        )
         return WAITING_ADMIN_DATE
     return ConversationHandler.END
 
@@ -560,9 +646,13 @@ async def admin_add_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur.execute("INSERT OR IGNORE INTO time_slots (date, time, is_booked) VALUES (?, ?, 0)", (date, time_str))
         conn.commit()
         conn.close()
-        await update.message.reply_text(f"✅ Слот {date} {time_str} додано!", reply_markup=admin_menu())
+        await update.message.reply_text(f"✅ Слот {date} о {time_str} додано!", reply_markup=admin_menu())
     except:
-        await update.message.reply_text("❌ Невірний формат. Введи РРРР-ММ-ДД ГГ:ХХ:", reply_markup=cancel_menu())
+        await update.message.reply_text(
+            "❌ Невірний формат.\nВведи як <code>РРРР-ММ-ДД ГГ:ХХ</code>:",
+            parse_mode="HTML",
+            reply_markup=cancel_menu()
+        )
         return WAITING_ADMIN_TIME
     return ConversationHandler.END
 
@@ -577,7 +667,11 @@ async def admin_close_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         datetime.strptime(text, "%Y-%m-%d")
     except ValueError:
-        await update.message.reply_text("❌ Невірний формат. Введи РРРР-ММ-ДД:", reply_markup=cancel_menu())
+        await update.message.reply_text(
+            "❌ Невірний формат.\nВведи дату як <code>РРРР-ММ-ДД</code>:",
+            parse_mode="HTML",
+            reply_markup=cancel_menu()
+        )
         return WAITING_ADMIN_CLOSE_DATE
 
     if context.user_data.get("view_schedule"):
@@ -601,7 +695,8 @@ async def admin_close_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     lines.append(f"🟢 {r['time']} — вільно")
             await update.message.reply_text(
-                f"📅 Розклад на {text}:\n\n" + "\n".join(lines),
+                f"📅 <b>Розклад на {text}:</b>\n\n" + "\n".join(lines),
+                parse_mode="HTML",
                 reply_markup=admin_menu()
             )
         else:
@@ -640,7 +735,7 @@ async def admin_cancel_booking(update: Update, context: ContextTypes.DEFAULT_TYP
         conn.close()
 
         if not booking:
-            await update.message.reply_text("❌ Запис не знайдено.", reply_markup=admin_menu())
+            await update.message.reply_text("❌ Запис не знайдено або вже скасований.", reply_markup=admin_menu())
             return ConversationHandler.END
 
         cancel_booking(booking_id)
@@ -651,14 +746,14 @@ async def admin_cancel_booking(update: Update, context: ContextTypes.DEFAULT_TYP
         try:
             await context.bot.send_message(
                 chat_id=booking["user_id"],
-                text=f"❌ Ваш запис на {booking['date']} о {booking['time']} скасовано адміністратором.\n\nВибачте за незручності!"
+                text=f"❌ Ваш запис на {booking['date']} о {booking['time']} скасовано адміністратором.\n\nВибачте за незручності! Будемо раді записати вас на інший час 😊"
             )
         except:
             pass
 
-        await update.message.reply_text(f"✅ Запис #{booking_id} скасовано.", reply_markup=admin_menu())
+        await update.message.reply_text(f"✅ Запис #{booking_id} скасовано.\nКлієнт отримав повідомлення.", reply_markup=admin_menu())
     except ValueError:
-        await update.message.reply_text("❌ Введи правильний ID.", reply_markup=cancel_menu())
+        await update.message.reply_text("❌ Введи правильний ID (число).", reply_markup=cancel_menu())
         return WAITING_ADMIN_CANCEL_ID
     return ConversationHandler.END
 
@@ -671,10 +766,7 @@ def restore_reminders(app):
     try:
         conn = get_db()
         cur = conn.cursor()
-        cur.execute("""
-            SELECT id, user_id, date, time FROM bookings
-            WHERE status = 'active'
-        """)
+        cur.execute("SELECT id, user_id, date, time FROM bookings WHERE status = 'active'")
         rows = cur.fetchall()
         conn.close()
         count = 0
