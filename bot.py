@@ -71,8 +71,14 @@ def init_db():
             FOREIGN KEY (booking_id) REFERENCES bookings(id)
         )
     """)
-    cur.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS description TEXT")
-    cur.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS contact TEXT")
+    try:
+    cur.execute("ALTER TABLE bookings ADD COLUMN description TEXT")
+except:
+    pass
+try:
+    cur.execute("ALTER TABLE bookings ADD COLUMN contact TEXT")
+except:
+    pass
     conn.commit()
     conn.close()
 
