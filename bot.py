@@ -17,10 +17,13 @@ scheduler = AsyncIOScheduler()
 
 WAITING_NAME = 1
 WAITING_PHONE = 2
-WAITING_ADMIN_DATE = 3
-WAITING_ADMIN_TIME = 4
-WAITING_ADMIN_CLOSE_DATE = 5
-WAITING_ADMIN_CANCEL_ID = 6
+WAITING_DESC = 3
+WAITING_PHOTO = 4
+WAITING_CONTACT = 5
+WAITING_ADMIN_DATE = 6
+WAITING_ADMIN_TIME = 7
+WAITING_ADMIN_CLOSE_DATE = 8
+WAITING_ADMIN_CANCEL_ID = 9
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
@@ -54,10 +57,22 @@ def init_db():
             time TEXT,
             name TEXT,
             phone TEXT,
+            description TEXT,
+            contact TEXT,
             status TEXT DEFAULT 'active',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS booking_photos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            booking_id INTEGER,
+            file_id TEXT,
+            FOREIGN KEY (booking_id) REFERENCES bookings(id)
+        )
+    """)
+    cur.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS description TEXT")
+    cur.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS contact TEXT")
     conn.commit()
     conn.close()
 
@@ -124,15 +139,17 @@ def complete_old_bookings():
     conn.commit()
     conn.close()
 
-def create_booking(user_id, date, time, name, phone):
+def create_booking(user_id, date, time, name, phone, description, contact, photos):
     conn = get_db()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO bookings (user_id, date, time, name, phone, status)
-        VALUES (?, ?, ?, ?, ?, 'active')
-    """, (user_id, date, time, name, phone))
+        INSERT INTO bookings (user_id, date, time, name, phone, description, contact, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'active')
+    """, (user_id, date, time, name, phone, description, contact))
     booking_id = cur.lastrowid
     cur.execute("UPDATE time_slots SET is_booked = 1 WHERE date = ? AND time = ?", (date, time))
+    for photo_id in photos:
+        cur.execute("INSERT INTO booking_photos (booking_id, file_id) VALUES (?, ?)", (booking_id, photo_id))
     conn.commit()
     conn.close()
     return booking_id
@@ -147,6 +164,14 @@ def cancel_booking(booking_id):
         cur.execute("UPDATE time_slots SET is_booked = 0 WHERE date = ? AND time = ?", (row["date"], row["time"]))
         conn.commit()
     conn.close()
+
+def get_booking_photos(booking_id):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT file_id FROM booking_photos WHERE booking_id = ?", (booking_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return [r["file_id"] for r in rows]
 
 def schedule_reminder(app, booking_id, user_id, date, time_str):
     remind_dt = datetime.strptime(f"{date} {time_str}", "%Y-%m-%d %H:%M") - timedelta(hours=24)
@@ -194,6 +219,21 @@ def cancel_menu():
     keyboard = [[KeyboardButton("❌ Скасувати")]]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
+def skip_cancel_menu():
+    keyboard = [
+        [KeyboardButton("➡️ Пропустити")],
+        [KeyboardButton("❌ Скасувати")],
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+def photo_menu():
+    keyboard = [
+        [KeyboardButton("✅ Готово — більше фото немає")],
+        [KeyboardButton("➡️ Пропустити фото")],
+        [KeyboardButton("❌ Скасувати")],
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
 def dates_keyboard(dates):
     keyboard = []
     days_ua = {"Mon": "Пн", "Tue": "Вт", "Wed": "Ср", "Thu": "Чт", "Fri": "Пт", "Sat": "Сб", "Sun": "Нд"}
@@ -236,15 +276,12 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Формат: <code>2026-05-01</code>\n\n"
         "➕ <b>Додати слот</b> — додай час прийому\n"
         "Формат: <code>2026-05-01 10:00</code>\n\n"
-        "🔒 <b>Закрити день</b> — заблокуй день повністю\n"
-        "Клієнти не зможуть записатись на цей день\n\n"
+        "🔒 <b>Закрити день</b> — заблокуй день повністю\n\n"
         "🔓 <b>Відкрити день</b> — розблокуй закритий день\n\n"
         "📅 <b>Розклад на дату</b> — переглянь слоти\n"
         "🟢 вільний | 🔴 зайнятий\n\n"
-        "📋 <b>Майбутні записи</b> — всі активні записи\n"
-        "Тут видно ID для скасування\n\n"
-        "❌ <b>Скасувати запис</b> — введи ID запису\n"
-        "Клієнт отримає повідомлення про скасування\n\n"
+        "📋 <b>Майбутні записи</b> — всі активні записи\n\n"
+        "❌ <b>Скасувати запис</b> — введи ID запису\n\n"
         "Обери дію 👇",
         parse_mode="HTML",
         reply_markup=admin_menu()
@@ -265,8 +302,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif text == "➕ Додати день":
             await update.message.reply_text(
                 "📅 <b>Додати робочий день</b>\n\n"
-                "Введи дату у форматі:\n"
-                "<code>РРРР-ММ-ДД</code>\n\n"
+                "Введи дату:\n<code>РРРР-ММ-ДД</code>\n\n"
                 "Наприклад: <code>2026-05-01</code>",
                 parse_mode="HTML",
                 reply_markup=cancel_menu()
@@ -276,10 +312,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif text == "➕ Додати слот":
             await update.message.reply_text(
                 "🕐 <b>Додати слот часу</b>\n\n"
-                "Введи дату і час у форматі:\n"
-                "<code>РРРР-ММ-ДД ГГ:ХХ</code>\n\n"
-                "Наприклад: <code>2026-05-01 10:00</code>\n\n"
-                "💡 Якщо день ще не створений — він створюється автоматично",
+                "Введи дату і час:\n<code>РРРР-ММ-ДД ГГ:ХХ</code>\n\n"
+                "Наприклад: <code>2026-05-01 10:00</code>",
                 parse_mode="HTML",
                 reply_markup=cancel_menu()
             )
@@ -288,10 +322,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif text == "🔒 Закрити день":
             await update.message.reply_text(
                 "🔒 <b>Закрити день</b>\n\n"
-                "Введи дату яку хочеш закрити:\n"
-                "<code>РРРР-ММ-ДД</code>\n\n"
-                "Наприклад: <code>2026-05-01</code>\n\n"
-                "⚠️ Клієнти не зможуть бачити слоти цього дня",
+                "Введи дату:\n<code>РРРР-ММ-ДД</code>",
                 parse_mode="HTML",
                 reply_markup=cancel_menu()
             )
@@ -300,9 +331,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif text == "🔓 Відкрити день":
             await update.message.reply_text(
                 "🔓 <b>Відкрити день</b>\n\n"
-                "Введи дату яку хочеш відкрити:\n"
-                "<code>РРРР-ММ-ДД</code>\n\n"
-                "Наприклад: <code>2026-05-01</code>",
+                "Введи дату:\n<code>РРРР-ММ-ДД</code>",
                 parse_mode="HTML",
                 reply_markup=cancel_menu()
             )
@@ -312,10 +341,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif text == "📅 Розклад на дату":
             await update.message.reply_text(
                 "📅 <b>Розклад на дату</b>\n\n"
-                "Введи дату для перегляду:\n"
-                "<code>РРРР-ММ-ДД</code>\n\n"
-                "🟢 — вільний слот\n"
-                "🔴 — зайнятий (ім'я і телефон клієнта)",
+                "Введи дату:\n<code>РРРР-ММ-ДД</code>",
                 parse_mode="HTML",
                 reply_markup=cancel_menu()
             )
@@ -327,10 +353,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cur = conn.cursor()
             today = str(datetime.now().date())
             cur.execute("""
-                SELECT b.id, b.date, b.time, b.name, b.phone
-                FROM bookings b
-                WHERE b.status = 'active' AND b.date >= ?
-                ORDER BY b.date, b.time
+                SELECT id, date, time, name, phone
+                FROM bookings
+                WHERE status = 'active' AND date >= ?
+                ORDER BY date, time
             """, (today,))
             rows = cur.fetchall()
             conn.close()
@@ -341,7 +367,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     lines.append(f"#{r['id']} | {dt.strftime('%d.%m %H:%M')} | {r['name']} | {r['phone']}")
                 await update.message.reply_text(
                     "📋 <b>Майбутні записи:</b>\n\n" + "\n".join(lines) +
-                    "\n\n💡 ID використовуй для скасування запису",
+                    "\n\n💡 ID використовуй для скасування",
                     parse_mode="HTML",
                     reply_markup=admin_menu()
                 )
@@ -352,8 +378,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 "❌ <b>Скасувати запис клієнта</b>\n\n"
                 "Введи ID запису (число).\n"
-                "ID можна знайти в розділі 📋 Майбутні записи\n\n"
-                "Клієнт автоматично отримає повідомлення про скасування",
+                "ID видно в 📋 Майбутні записи",
                 parse_mode="HTML",
                 reply_markup=cancel_menu()
             )
@@ -389,6 +414,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         booking = get_user_booking(uid)
         if booking:
             dt = datetime.strptime(f"{booking['date']} {booking['time']}", "%Y-%m-%d %H:%M")
+            desc = booking['description'] or "—"
+            contact = booking['contact'] or "—"
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("❌ Скасувати запис", callback_data=f"cancel_{booking['id']}")]
             ])
@@ -397,7 +424,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📅 Дата: {dt.strftime('%d.%m.%Y')}\n"
                 f"🕐 Час: {booking['time']}\n"
                 f"👤 Ім'я: {booking['name']}\n"
-                f"📞 Телефон: {booking['phone']}",
+                f"📞 Телефон: {booking['phone']}\n"
+                f"📝 Опис: {desc}\n"
+                f"💬 Контакт: {contact}",
                 parse_mode="HTML",
                 reply_markup=keyboard
             )
@@ -525,15 +554,23 @@ async def booking_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await query.edit_message_text("✅ Запис скасовано.\n\nБудемо раді бачити тебе знову! 😊")
 
+            # Повідомлення адміну про скасування клієнтом
             try:
+                dt = datetime.strptime(f"{booking['date']} {booking['time']}", "%Y-%m-%d %H:%M")
+                desc = booking['description'] or "—"
+                contact = booking['contact'] or "—"
                 await context.bot.send_message(
                     chat_id=ADMIN_ID,
-                    text=f"❌ Клієнт скасував запис!\n\n"
-                         f"#{booking['id']} | {booking['date']} {booking['time']}\n"
-                         f"👤 {booking['name']} | 📞 {booking['phone']}"
+                    text=f"❌ <b>Клієнт скасував запис!</b>\n\n"
+                         f"#{booking['id']} | {dt.strftime('%d.%m.%Y')} о {booking['time']}\n"
+                         f"👤 {booking['name']}\n"
+                         f"📞 {booking['phone']}\n"
+                         f"📝 Опис: {desc}\n"
+                         f"💬 Контакт: {contact}",
+                    parse_mode="HTML"
                 )
-            except:
-                pass
+            except Exception as e:
+                logging.error(f"Admin notify error: {e}")
         else:
             await query.edit_message_text("❌ Запис не знайдено.")
 
@@ -544,7 +581,7 @@ async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     context.user_data["booking_name"] = text
     await update.message.reply_text(
-        f"👤 Ім'я: {text}\n\n📞 Тепер введи номер телефону:",
+        f"👤 Ім'я: {text}\n\n📞 Введи номер телефону:",
         reply_markup=cancel_menu()
     )
     return WAITING_PHONE
@@ -554,13 +591,79 @@ async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "❌ Скасувати":
         await update.message.reply_text("Скасовано.", reply_markup=main_menu())
         return ConversationHandler.END
+    context.user_data["booking_phone"] = text
+    await update.message.reply_text(
+        f"📞 Телефон: {text}\n\n"
+        f"📝 Опиши що ти хочеш зробити:\n\n"
+        f"Наприклад: манікюр з гель-лаком, корекція, дизайн метелики",
+        reply_markup=cancel_menu()
+    )
+    return WAITING_DESC
+
+async def get_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text == "❌ Скасувати":
+        await update.message.reply_text("Скасовано.", reply_markup=main_menu())
+        return ConversationHandler.END
+    context.user_data["booking_desc"] = text
+    context.user_data["booking_photos"] = []
+    await update.message.reply_text(
+        "📸 Надішли фото прикладу роботи (можна кілька з галереї).\n\n"
+        "Коли надішлеш всі фото — натисни '✅ Готово'\n"
+        "Або натисни '➡️ Пропустити' якщо фото немає",
+        reply_markup=photo_menu()
+    )
+    return WAITING_PHOTO
+
+async def get_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Якщо це текстова кнопка
+    if update.message.text:
+        text = update.message.text.strip()
+        if text == "❌ Скасувати":
+            await update.message.reply_text("Скасовано.", reply_markup=main_menu())
+            return ConversationHandler.END
+        elif text in ["✅ Готово — більше фото немає", "➡️ Пропустити фото"]:
+            await update.message.reply_text(
+                "💬 Залиш свій Instagram або Telegram для зв'язку з майстром.\n\n"
+                "Наприклад: @username або instagram.com/username\n\n"
+                "Або натисни '➡️ Пропустити'",
+                reply_markup=skip_cancel_menu()
+            )
+            return WAITING_CONTACT
+
+    # Якщо це фото
+    if update.message.photo:
+        photos = context.user_data.get("booking_photos", [])
+        # Беремо найбільше фото
+        file_id = update.message.photo[-1].file_id
+        photos.append(file_id)
+        context.user_data["booking_photos"] = photos
+        await update.message.reply_text(
+            f"✅ Фото {len(photos)} додано!\n\nДодай ще або натисни '✅ Готово'",
+            reply_markup=photo_menu()
+        )
+        return WAITING_PHOTO
+
+    return WAITING_PHOTO
+
+async def get_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text == "❌ Скасувати":
+        await update.message.reply_text("Скасовано.", reply_markup=main_menu())
+        return ConversationHandler.END
+
+    contact = None if text == "➡️ Пропустити" else text
+    context.user_data["booking_contact"] = contact
 
     uid = update.message.from_user.id
     date = context.user_data.get("booking_date")
     time_str = context.user_data.get("booking_time")
     name = context.user_data.get("booking_name")
-    phone = text
+    phone = context.user_data.get("booking_phone")
+    desc = context.user_data.get("booking_desc")
+    photos = context.user_data.get("booking_photos", [])
 
+    # Перевірка чи слот ще вільний
     conn = get_db()
     cur = conn.cursor()
     cur.execute("SELECT is_booked FROM time_slots WHERE date = ? AND time = ?", (date, time_str))
@@ -574,36 +677,54 @@ async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    booking_id = create_booking(uid, date, time_str, name, phone)
+    booking_id = create_booking(uid, date, time_str, name, phone, desc, contact, photos)
     dt = datetime.strptime(f"{date} {time_str}", "%Y-%m-%d %H:%M")
 
     schedule_reminder(context.application, booking_id, uid, date, time_str)
     context.user_data.clear()
 
+    contact_text = contact or "не вказано"
     await update.message.reply_text(
         f"✅ <b>Запис підтверджено!</b>\n\n"
         f"📅 Дата: {dt.strftime('%d.%m.%Y')}\n"
         f"🕐 Час: {time_str}\n"
         f"👤 Ім'я: {name}\n"
-        f"📞 Телефон: {phone}\n\n"
+        f"📞 Телефон: {phone}\n"
+        f"📝 Опис: {desc}\n"
+        f"💬 Контакт: {contact_text}\n\n"
         f"За 24 години до візиту надішлемо нагадування 🔔\n\n"
         f"Чекаємо на тебе! ❤️",
         parse_mode="HTML",
         reply_markup=main_menu()
     )
 
+    # Повідомлення адміну
     try:
-        await context.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=f"🆕 <b>Новий запис!</b>\n\n"
-                 f"#{booking_id} | {dt.strftime('%d.%m.%Y')} о {time_str}\n"
-                 f"👤 {name}\n"
-                 f"📞 {phone}\n"
-                 f"Telegram ID: {uid}",
-            parse_mode="HTML"
+        admin_text = (
+            f"🆕 <b>Новий запис!</b>\n\n"
+            f"#{booking_id} | {dt.strftime('%d.%m.%Y')} о {time_str}\n"
+            f"👤 {name}\n"
+            f"📞 {phone}\n"
+            f"📝 Опис: {desc}\n"
+            f"💬 Контакт: {contact_text}\n"
+            f"Telegram ID: {uid}"
         )
-    except:
-        pass
+
+        if photos:
+            # Надсилаємо фото альбомом
+            from telegram import InputMediaPhoto
+            media = [InputMediaPhoto(media=photos[0], caption=admin_text, parse_mode="HTML")]
+            for photo_id in photos[1:]:
+                media.append(InputMediaPhoto(media=photo_id))
+            await context.bot.send_media_group(chat_id=ADMIN_ID, media=media)
+        else:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=admin_text,
+                parse_mode="HTML"
+            )
+    except Exception as e:
+        logging.error(f"Admin notify error: {e}")
 
     return ConversationHandler.END
 
@@ -622,7 +743,7 @@ async def admin_add_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ День {text} додано!", reply_markup=admin_menu())
     except ValueError:
         await update.message.reply_text(
-            "❌ Невірний формат.\nВведи дату як <code>РРРР-ММ-ДД</code>:",
+            "❌ Невірний формат.\nВведи як <code>РРРР-ММ-ДД</code>:",
             parse_mode="HTML",
             reply_markup=cancel_menu()
         )
@@ -668,7 +789,7 @@ async def admin_close_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
         datetime.strptime(text, "%Y-%m-%d")
     except ValueError:
         await update.message.reply_text(
-            "❌ Невірний формат.\nВведи дату як <code>РРРР-ММ-ДД</code>:",
+            "❌ Невірний формат.\nВведи як <code>РРРР-ММ-ДД</code>:",
             parse_mode="HTML",
             reply_markup=cancel_menu()
         )
@@ -751,7 +872,10 @@ async def admin_cancel_booking(update: Update, context: ContextTypes.DEFAULT_TYP
         except:
             pass
 
-        await update.message.reply_text(f"✅ Запис #{booking_id} скасовано.\nКлієнт отримав повідомлення.", reply_markup=admin_menu())
+        await update.message.reply_text(
+            f"✅ Запис #{booking_id} скасовано.\nКлієнт отримав повідомлення.",
+            reply_markup=admin_menu()
+        )
     except ValueError:
         await update.message.reply_text("❌ Введи правильний ID (число).", reply_markup=cancel_menu())
         return WAITING_ADMIN_CANCEL_ID
@@ -799,6 +923,12 @@ def main():
         states={
             WAITING_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_name)],
             WAITING_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_phone)],
+            WAITING_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_desc)],
+            WAITING_PHOTO: [
+                MessageHandler(filters.PHOTO, get_photo),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, get_photo),
+            ],
+            WAITING_CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_contact)],
             WAITING_ADMIN_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_day)],
             WAITING_ADMIN_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_slot)],
             WAITING_ADMIN_CLOSE_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_close_day)],
