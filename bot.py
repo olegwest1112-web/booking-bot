@@ -1,5 +1,5 @@
 import logging
-import sqlite3
+import psycopg2
 from datetime import datetime, timedelta
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
@@ -10,7 +10,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 TOKEN = "8518866982:AAFIow5GsXT0oGnvvSJCb7T-wJ1EQdr-IR8"
 ADMIN_ID = 8308164205
-DB_PATH = "/app/booking.db"
+DATABASE_URL = "postgresql://postgres:wUgRMmkrWdpPmiEpaSvtNECydROvVUwC@postgres.railway.internal:5432/railway"
 
 logging.basicConfig(level=logging.INFO)
 scheduler = AsyncIOScheduler()
@@ -24,8 +24,7 @@ WAITING_ADMIN_CANCEL_ID = 6
 WAITING_ADMIN_PRICE = 7
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = psycopg2.connect(DATABASE_URL)
     return conn
 
 def init_db():
@@ -33,14 +32,14 @@ def init_db():
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS work_days (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             date TEXT UNIQUE,
             is_open INTEGER DEFAULT 1
         )
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS time_slots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             date TEXT,
             time TEXT,
             is_booked INTEGER DEFAULT 0,
@@ -49,8 +48,8 @@ def init_db():
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS bookings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
             date TEXT,
             time TEXT,
             name TEXT,
@@ -58,26 +57,26 @@ def init_db():
             description TEXT,
             contact TEXT,
             status TEXT DEFAULT 'active',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT NOW()
         )
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS booking_photos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             booking_id INTEGER,
             file_id TEXT,
             FOREIGN KEY (booking_id) REFERENCES bookings(id)
         )
     """)
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
+        CREATE TABLE IF NOT EXISTS booking_settings (
             key TEXT PRIMARY KEY,
             value TEXT
         )
     """)
     cur.execute("""
-        INSERT OR IGNORE INTO settings (key, value) VALUES ('price_text',
-'💅 Прайс-лист
+        INSERT INTO booking_settings (key, value)
+        VALUES ('price_text', '💅 Прайс-лист
 
 Манікюр:
 - Класичний манікюр — 350₴
@@ -103,17 +102,20 @@ def init_db():
 - Складний дизайн — від 200₴
 
 💬 Точну ціну уточнюй у майстра')
+        ON CONFLICT (key) DO NOTHING
     """)
     conn.commit()
+    cur.close()
     conn.close()
 
 def get_price_text():
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT value FROM settings WHERE key = 'price_text'")
+    cur.execute("SELECT value FROM booking_settings WHERE key = 'price_text'")
     row = cur.fetchone()
+    cur.close()
     conn.close()
-    return row["value"] if row else "Прайс не вказано"
+    return row[0] if row else "Прайс не вказано"
 
 def get_available_dates():
     conn = get_db()
@@ -125,82 +127,100 @@ def get_available_dates():
         JOIN work_days wd ON ts.date = wd.date
         WHERE wd.is_open = 1
         AND ts.is_booked = 0
-        AND ts.date >= ? AND ts.date <= ?
+        AND ts.date >= %s AND ts.date <= %s
         ORDER BY ts.date
     """, (str(today), str(month_later)))
     rows = cur.fetchall()
+    cur.close()
     conn.close()
-    return [r["date"] for r in rows]
+    return [r[0] for r in rows]
 
 def get_available_times(date):
     conn = get_db()
     cur = conn.cursor()
     now = datetime.now()
-    cur.execute("SELECT time FROM time_slots WHERE date = ? AND is_booked = 0 ORDER BY time", (date,))
+    cur.execute("SELECT time FROM time_slots WHERE date = %s AND is_booked = 0 ORDER BY time", (date,))
     rows = cur.fetchall()
+    cur.close()
     conn.close()
     result = []
     for r in rows:
-        slot_dt = datetime.strptime(f"{date} {r['time']}", "%Y-%m-%d %H:%M")
+        slot_dt = datetime.strptime(date + " " + r[0], "%Y-%m-%d %H:%M")
         if slot_dt > now:
-            result.append(r["time"])
+            result.append(r[0])
     return result
 
 def get_user_booking(user_id):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM bookings WHERE user_id = ? AND status = 'active' ORDER BY date DESC LIMIT 1", (user_id,))
+    cur.execute("SELECT id, user_id, date, time, name, phone, description, contact, status FROM bookings WHERE user_id = %s AND status = 'active' ORDER BY date DESC LIMIT 1", (user_id,))
     row = cur.fetchone()
+    cur.close()
     conn.close()
     if row:
-        slot_dt = datetime.strptime(f"{row['date']} {row['time']}", "%Y-%m-%d %H:%M")
+        slot_dt = datetime.strptime(row[2] + " " + row[3], "%Y-%m-%d %H:%M")
         if slot_dt < datetime.now():
             complete_old_bookings()
             return None
-    return row
+        return {"id": row[0], "user_id": row[1], "date": row[2], "time": row[3], "name": row[4], "phone": row[5], "description": row[6], "contact": row[7], "status": row[8]}
+    return None
 
 def complete_old_bookings():
     conn = get_db()
     cur = conn.cursor()
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    cur.execute("UPDATE bookings SET status = 'completed' WHERE status = 'active' AND datetime(date || ' ' || time) < datetime(?)", (now,))
+    cur.execute("UPDATE bookings SET status = 'completed' WHERE status = 'active' AND (date || ' ' || time)::timestamp < %s::timestamp", (now,))
     conn.commit()
+    cur.close()
     conn.close()
 
 def create_booking(user_id, date, time, name, phone, description, contact, photos):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("INSERT INTO bookings (user_id, date, time, name, phone, description, contact, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'active')", (user_id, date, time, name, phone, description, contact))
-    booking_id = cur.lastrowid
-    cur.execute("UPDATE time_slots SET is_booked = 1 WHERE date = ? AND time = ?", (date, time))
+    cur.execute("INSERT INTO bookings (user_id, date, time, name, phone, description, contact, status) VALUES (%s, %s, %s, %s, %s, %s, %s, 'active') RETURNING id", (user_id, date, time, name, phone, description, contact))
+    booking_id = cur.fetchone()[0]
+    cur.execute("UPDATE time_slots SET is_booked = 1 WHERE date = %s AND time = %s", (date, time))
     for photo_id in photos:
-        cur.execute("INSERT INTO booking_photos (booking_id, file_id) VALUES (?, ?)", (booking_id, photo_id))
+        cur.execute("INSERT INTO booking_photos (booking_id, file_id) VALUES (%s, %s)", (booking_id, photo_id))
     conn.commit()
+    cur.close()
     conn.close()
     return booking_id
 
 def cancel_booking(booking_id):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT date, time FROM bookings WHERE id = ?", (booking_id,))
+    cur.execute("SELECT date, time FROM bookings WHERE id = %s", (booking_id,))
     row = cur.fetchone()
     if row:
-        cur.execute("UPDATE bookings SET status = 'cancelled' WHERE id = ?", (booking_id,))
-        cur.execute("UPDATE time_slots SET is_booked = 0 WHERE date = ? AND time = ?", (row["date"], row["time"]))
+        cur.execute("UPDATE bookings SET status = 'cancelled' WHERE id = %s", (booking_id,))
+        cur.execute("UPDATE time_slots SET is_booked = 0 WHERE date = %s AND time = %s", (row[0], row[1]))
         conn.commit()
+    cur.close()
     conn.close()
 
+def get_booking_by_id(booking_id):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, user_id, date, time, name, phone, description, contact, status FROM bookings WHERE id = %s", (booking_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    if row:
+        return {"id": row[0], "user_id": row[1], "date": row[2], "time": row[3], "name": row[4], "phone": row[5], "description": row[6], "contact": row[7], "status": row[8]}
+    return None
+
 def schedule_reminder(app, booking_id, user_id, date, time_str):
-    remind_dt = datetime.strptime(f"{date} {time_str}", "%Y-%m-%d %H:%M") - timedelta(hours=24)
+    remind_dt = datetime.strptime(date + " " + time_str, "%Y-%m-%d %H:%M") - timedelta(hours=24)
     if remind_dt <= datetime.now():
         return
-    scheduler.add_job(send_reminder, "date", run_date=remind_dt, args=[app, user_id, time_str], id=f"reminder_{booking_id}", replace_existing=True)
+    scheduler.add_job(send_reminder, "date", run_date=remind_dt, args=[app, user_id, time_str], id="reminder_" + str(booking_id), replace_existing=True)
 
 async def send_reminder(app, user_id, time_str):
     try:
-        await app.bot.send_message(chat_id=user_id, text=f"🔔 Нагадування!\n\nВи записані завтра о {time_str}.\nЧекаємо на вас! ❤️")
+        await app.bot.send_message(chat_id=user_id, text="🔔 Нагадування!\n\nВи записані завтра о " + time_str + ".\nЧекаємо на вас! ❤️")
     except Exception as e:
-        logging.error(f"Reminder error: {e}")
+        logging.error("Reminder error: " + str(e))
 
 def main_menu():
     return ReplyKeyboardMarkup([
@@ -239,7 +259,7 @@ def dates_keyboard(dates):
     for date in dates:
         dt = datetime.strptime(date, "%Y-%m-%d")
         day = days_ua.get(dt.strftime("%a"), dt.strftime("%a"))
-        keyboard.append([InlineKeyboardButton(f"{dt.strftime('%d.%m.%Y')} ({day})", callback_data=f"date_{date}")])
+        keyboard.append([InlineKeyboardButton(dt.strftime('%d.%m.%Y') + " (" + day + ")", callback_data="date_" + date)])
     keyboard.append([InlineKeyboardButton("❌ Скасувати", callback_data="cancel_booking")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -247,7 +267,7 @@ def times_keyboard(date, times):
     keyboard = []
     row = []
     for t in times:
-        row.append(InlineKeyboardButton(t, callback_data=f"time_{date}_{t}"))
+        row.append(InlineKeyboardButton(t, callback_data="time_" + date + "_" + t))
         if len(row) == 3:
             keyboard.append(row)
             row = []
@@ -263,7 +283,7 @@ def admin_dates_keyboard(action):
     for i in range(10):
         dt = today + timedelta(days=i)
         day = days_ua.get(dt.strftime("%a"), dt.strftime("%a"))
-        keyboard.append([InlineKeyboardButton(f"{dt.strftime('%d.%m.%Y')} ({day})", callback_data=f"admin_{action}_{dt.strftime('%Y-%m-%d')}")])
+        keyboard.append([InlineKeyboardButton(dt.strftime('%d.%m.%Y') + " (" + day + ")", callback_data="admin_" + action + "_" + dt.strftime('%Y-%m-%d'))])
     keyboard.append([InlineKeyboardButton("❌ Скасувати", callback_data="admin_cancel")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -271,14 +291,14 @@ def admin_times_keyboard(date):
     keyboard = []
     row = []
     for h in range(9, 21):
-        t = f"{h:02d}:00"
-        row.append(InlineKeyboardButton(t, callback_data=f"admin_time_{date}_{t}"))
+        t = str(h).zfill(2) + ":00"
+        row.append(InlineKeyboardButton(t, callback_data="admin_time_" + date + "_" + t))
         if len(row) == 3:
             keyboard.append(row)
             row = []
     if row:
         keyboard.append(row)
-    keyboard.append([InlineKeyboardButton("✏️ Ввести свій час", callback_data=f"admin_custom_time_{date}")])
+    keyboard.append([InlineKeyboardButton("✏️ Ввести свій час", callback_data="admin_custom_time_" + date)])
     keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="admin_add_slot_back")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -311,7 +331,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     uid = update.message.from_user.id
 
-    # Обробка кастомного часу від адміна
     if context.user_data.get("waiting_custom_time") and uid == ADMIN_ID:
         if text == "❌ Скасувати":
             context.user_data.pop("waiting_custom_time", None)
@@ -322,18 +341,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             date = context.user_data.get("admin_slot_date")
             conn = get_db()
             cur = conn.cursor()
-            cur.execute("INSERT OR IGNORE INTO work_days (date, is_open) VALUES (?, 1)", (date,))
-            cur.execute("INSERT OR IGNORE INTO time_slots (date, time, is_booked) VALUES (?, ?, 0)", (date, text))
+            cur.execute("INSERT INTO work_days (date, is_open) VALUES (%s, 1) ON CONFLICT (date) DO NOTHING", (date,))
+            cur.execute("INSERT INTO time_slots (date, time, is_booked) VALUES (%s, %s, 0) ON CONFLICT (date, time) DO NOTHING", (date, text))
             conn.commit()
+            cur.close()
             conn.close()
             context.user_data.pop("waiting_custom_time", None)
             dt = datetime.strptime(date, "%Y-%m-%d")
-            await update.message.reply_text(f"✅ Слот {dt.strftime('%d.%m.%Y')} о {text} додано!", reply_markup=admin_menu())
+            await update.message.reply_text("✅ Слот " + dt.strftime('%d.%m.%Y') + " о " + text + " додано!", reply_markup=admin_menu())
         except ValueError:
             await update.message.reply_text("❌ Невірний формат.\nВведи як <code>ГГ:ХХ</code>:", parse_mode="HTML", reply_markup=cancel_menu())
         return ConversationHandler.END
 
-    # Адмін панель
     if context.user_data.get("admin_mode") and uid == ADMIN_ID:
 
         if text == "◀️ Вийти з адмінки":
@@ -359,15 +378,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif text == "📋 Майбутні записи":
             conn = get_db()
             cur = conn.cursor()
-            cur.execute("SELECT id, date, time, name, phone FROM bookings WHERE status = 'active' AND date >= ? ORDER BY date, time", (str(datetime.now().date()),))
+            cur.execute("SELECT id, date, time, name, phone FROM bookings WHERE status = 'active' AND date >= %s ORDER BY date, time", (str(datetime.now().date()),))
             rows = cur.fetchall()
+            cur.close()
             conn.close()
             if rows:
                 lines = []
                 for r in rows:
-                    dt_str = r['date'] + " " + r['time']
-                    dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M").strftime('%d.%m %H:%M')
-                    lines.append("#" + str(r['id']) + " | " + dt + " | " + r['name'] + " | " + r['phone'])
+                    dt = datetime.strptime(r[1] + " " + r[2], "%Y-%m-%d %H:%M").strftime('%d.%m %H:%M')
+                    lines.append("#" + str(r[0]) + " | " + dt + " | " + r[3] + " | " + r[4])
                 await update.message.reply_text("📋 <b>Майбутні записи:</b>\n\n" + "\n".join(lines) + "\n\n💡 ID використовуй для скасування", parse_mode="HTML", reply_markup=admin_menu())
             else:
                 await update.message.reply_text("Активних записів немає.", reply_markup=admin_menu())
@@ -378,20 +397,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif text == "💰 Редагувати прайс":
             current = get_price_text()
-            await update.message.reply_text(f"💰 <b>Поточний прайс:</b>\n\n{current}\n\nНадішли новий текст прайсу:", parse_mode="HTML", reply_markup=cancel_menu())
+            await update.message.reply_text("💰 <b>Поточний прайс:</b>\n\n" + current + "\n\nНадішли новий текст прайсу:", parse_mode="HTML", reply_markup=cancel_menu())
             return WAITING_ADMIN_PRICE
 
         return ConversationHandler.END
 
-    # Звичайне меню
     if text == "📅 Записатись":
         existing = get_user_booking(uid)
         if existing:
             dt = datetime.strptime(existing['date'] + " " + existing['time'], "%Y-%m-%d %H:%M")
-            await update.message.reply_text(
-                "❌ У тебе вже є активний запис:\n\n📅 " + dt.strftime('%d.%m.%Y') + " о " + existing['time'] + "\n👤 " + existing['name'] + "\n\nСпочатку скасуй його через '📋 Мій запис'.",
-                reply_markup=main_menu()
-            )
+            await update.message.reply_text("❌ У тебе вже є активний запис:\n\n📅 " + dt.strftime('%d.%m.%Y') + " о " + existing['time'] + "\n👤 " + existing['name'] + "\n\nСпочатку скасуй його через '📋 Мій запис'.", reply_markup=main_menu())
             return ConversationHandler.END
         dates = get_available_dates()
         if not dates:
@@ -443,11 +458,11 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         date = data.replace("admin_addday_", "")
         conn = get_db()
         cur = conn.cursor()
-        cur.execute("INSERT OR IGNORE INTO work_days (date, is_open) VALUES (?, 1)", (date,))
+        cur.execute("INSERT INTO work_days (date, is_open) VALUES (%s, 1) ON CONFLICT (date) DO NOTHING", (date,))
         conn.commit()
+        cur.close()
         conn.close()
-        dt = datetime.strptime(date, "%Y-%m-%d")
-        await query.edit_message_text("✅ День " + dt.strftime('%d.%m.%Y') + " додано!")
+        await query.edit_message_text("✅ День " + datetime.strptime(date, "%Y-%m-%d").strftime('%d.%m.%Y') + " додано!")
 
     elif data.startswith("admin_addslot_"):
         date = data.replace("admin_addslot_", "")
@@ -461,12 +476,12 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         time_str = parts[1]
         conn = get_db()
         cur = conn.cursor()
-        cur.execute("INSERT OR IGNORE INTO work_days (date, is_open) VALUES (?, 1)", (date,))
-        cur.execute("INSERT OR IGNORE INTO time_slots (date, time, is_booked) VALUES (?, ?, 0)", (date, time_str))
+        cur.execute("INSERT INTO work_days (date, is_open) VALUES (%s, 1) ON CONFLICT (date) DO NOTHING", (date,))
+        cur.execute("INSERT INTO time_slots (date, time, is_booked) VALUES (%s, %s, 0) ON CONFLICT (date, time) DO NOTHING", (date, time_str))
         conn.commit()
+        cur.close()
         conn.close()
-        dt = datetime.strptime(date, "%Y-%m-%d")
-        await query.edit_message_text("✅ Слот " + dt.strftime('%d.%m.%Y') + " о " + time_str + " додано!")
+        await query.edit_message_text("✅ Слот " + datetime.strptime(date, "%Y-%m-%d").strftime('%d.%m.%Y') + " о " + time_str + " додано!")
 
     elif data.startswith("admin_custom_time_"):
         date = data.replace("admin_custom_time_", "")
@@ -482,21 +497,21 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         date = data.replace("admin_closeday_", "")
         conn = get_db()
         cur = conn.cursor()
-        cur.execute("UPDATE work_days SET is_open = 0 WHERE date = ?", (date,))
+        cur.execute("UPDATE work_days SET is_open = 0 WHERE date = %s", (date,))
         conn.commit()
+        cur.close()
         conn.close()
-        dt = datetime.strptime(date, "%Y-%m-%d")
-        await query.edit_message_text("✅ День " + dt.strftime('%d.%m.%Y') + " закрито!")
+        await query.edit_message_text("✅ День " + datetime.strptime(date, "%Y-%m-%d").strftime('%d.%m.%Y') + " закрито!")
 
     elif data.startswith("admin_openday_"):
         date = data.replace("admin_openday_", "")
         conn = get_db()
         cur = conn.cursor()
-        cur.execute("UPDATE work_days SET is_open = 1 WHERE date = ?", (date,))
+        cur.execute("UPDATE work_days SET is_open = 1 WHERE date = %s", (date,))
         conn.commit()
+        cur.close()
         conn.close()
-        dt = datetime.strptime(date, "%Y-%m-%d")
-        await query.edit_message_text("✅ День " + dt.strftime('%d.%m.%Y') + " відкрито!")
+        await query.edit_message_text("✅ День " + datetime.strptime(date, "%Y-%m-%d").strftime('%d.%m.%Y') + " відкрито!")
 
     elif data.startswith("admin_schedule_"):
         date = data.replace("admin_schedule_", "")
@@ -506,18 +521,19 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             SELECT ts.time, ts.is_booked, b.name, b.phone, b.id
             FROM time_slots ts
             LEFT JOIN bookings b ON ts.date = b.date AND ts.time = b.time AND b.status = 'active'
-            WHERE ts.date = ? ORDER BY ts.time
+            WHERE ts.date = %s ORDER BY ts.time
         """, (date,))
         rows = cur.fetchall()
+        cur.close()
         conn.close()
         dt = datetime.strptime(date, "%Y-%m-%d")
         if rows:
             lines = []
             for r in rows:
-                if r["is_booked"]:
-                    lines.append("🔴 " + r['time'] + " — " + r['name'] + " | " + r['phone'] + " (#" + str(r['id']) + ")")
+                if r[1]:
+                    lines.append("🔴 " + r[0] + " — " + str(r[2]) + " | " + str(r[3]) + " (#" + str(r[4]) + ")")
                 else:
-                    lines.append("🟢 " + r['time'] + " — вільно")
+                    lines.append("🟢 " + r[0] + " — вільно")
             await query.edit_message_text("📅 <b>Розклад на " + dt.strftime('%d.%m.%Y') + ":</b>\n\n" + "\n".join(lines), parse_mode="HTML")
         else:
             await query.edit_message_text("Слотів на " + dt.strftime('%d.%m.%Y') + " немає.")
@@ -557,8 +573,7 @@ async def booking_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         time_str = parts[2]
         context.user_data["booking_date"] = date
         context.user_data["booking_time"] = time_str
-        dt = datetime.strptime(date, "%Y-%m-%d")
-        await query.edit_message_text("📅 " + dt.strftime('%d.%m.%Y') + " о " + time_str + "\n\n👤 Введи своє ім'я:")
+        await query.edit_message_text("📅 " + datetime.strptime(date, "%Y-%m-%d").strftime('%d.%m.%Y') + " о " + time_str + "\n\n👤 Введи своє ім'я:")
         return WAITING_NAME
 
     elif data.startswith("cancel_"):
@@ -578,11 +593,13 @@ async def booking_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         booking_id = int(data.replace("confirm_cancel_", ""))
         conn = get_db()
         cur = conn.cursor()
-        cur.execute("SELECT * FROM bookings WHERE id = ? AND user_id = ?", (booking_id, uid))
-        booking = cur.fetchone()
+        cur.execute("SELECT id, user_id, date, time, name, phone, description, contact FROM bookings WHERE id = %s AND user_id = %s", (booking_id, uid))
+        row = cur.fetchone()
+        cur.close()
         conn.close()
 
-        if booking:
+        if row:
+            booking = {"id": row[0], "user_id": row[1], "date": row[2], "time": row[3], "name": row[4], "phone": row[5], "description": row[6], "contact": row[7]}
             cancel_booking(booking_id)
             job_id = "reminder_" + str(booking_id)
             if scheduler.get_job(job_id):
@@ -672,11 +689,12 @@ async def get_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT is_booked FROM time_slots WHERE date = ? AND time = ?", (date, time_str))
+    cur.execute("SELECT is_booked FROM time_slots WHERE date = %s AND time = %s", (date, time_str))
     slot = cur.fetchone()
+    cur.close()
     conn.close()
 
-    if not slot or slot["is_booked"]:
+    if not slot or slot[0]:
         await update.message.reply_text("❌ На жаль цей слот вже зайнятий 😔\n\nВибери інший час:", reply_markup=main_menu())
         return ConversationHandler.END
 
@@ -714,13 +732,9 @@ async def admin_cancel_booking(update: Update, context: ContextTypes.DEFAULT_TYP
         return ConversationHandler.END
     try:
         booking_id = int(text)
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM bookings WHERE id = ? AND status = 'active'", (booking_id,))
-        booking = cur.fetchone()
-        conn.close()
+        booking = get_booking_by_id(booking_id)
 
-        if not booking:
+        if not booking or booking['status'] != 'active':
             await update.message.reply_text("❌ Запис не знайдено або вже скасований.", reply_markup=admin_menu())
             return ConversationHandler.END
 
@@ -750,8 +764,9 @@ async def admin_edit_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('price_text', ?)", (text,))
+    cur.execute("INSERT INTO booking_settings (key, value) VALUES ('price_text', %s) ON CONFLICT (key) DO UPDATE SET value = %s", (text, text))
     conn.commit()
+    cur.close()
     conn.close()
     await update.message.reply_text("✅ Прайс оновлено!", reply_markup=admin_menu())
     return ConversationHandler.END
@@ -767,12 +782,13 @@ def restore_reminders(app):
         cur = conn.cursor()
         cur.execute("SELECT id, user_id, date, time FROM bookings WHERE status = 'active'")
         rows = cur.fetchall()
+        cur.close()
         conn.close()
         count = 0
         for r in rows:
-            remind_dt = datetime.strptime(r['date'] + " " + r['time'], "%Y-%m-%d %H:%M") - timedelta(hours=24)
+            remind_dt = datetime.strptime(r[2] + " " + r[3], "%Y-%m-%d %H:%M") - timedelta(hours=24)
             if remind_dt > datetime.now():
-                scheduler.add_job(send_reminder, "date", run_date=remind_dt, args=[app, r["user_id"], r["time"]], id="reminder_" + str(r['id']), replace_existing=True)
+                scheduler.add_job(send_reminder, "date", run_date=remind_dt, args=[app, r[1], r[3]], id="reminder_" + str(r[0]), replace_existing=True)
                 count += 1
         print("Відновлено " + str(count) + " нагадувань")
     except Exception as e:
