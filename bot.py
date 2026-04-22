@@ -64,14 +64,24 @@ def init_db():
         CREATE TABLE IF NOT EXISTS booking_photos (
             id SERIAL PRIMARY KEY,
             booking_id INTEGER,
-            file_id TEXT,
-            FOREIGN KEY (booking_id) REFERENCES bookings(id)
+            file_id TEXT
         )
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS booking_settings (
             key TEXT PRIMARY KEY,
             value TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS waitlist (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
+            date TEXT,
+            name TEXT,
+            phone TEXT,
+            created_at TIMESTAMP DEFAULT NOW(),
+            status TEXT DEFAULT 'waiting'
         )
     """)
     cur.execute("""
@@ -127,6 +137,23 @@ def get_available_dates():
         JOIN work_days wd ON ts.date = wd.date
         WHERE wd.is_open = 1
         AND ts.is_booked = 0
+        AND ts.date >= %s AND ts.date <= %s
+        ORDER BY ts.date
+    """, (str(today), str(month_later)))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [r[0] for r in rows]
+
+def get_all_dates_with_slots():
+    conn = get_db()
+    cur = conn.cursor()
+    today = datetime.now().date()
+    month_later = today + timedelta(days=30)
+    cur.execute("""
+        SELECT DISTINCT ts.date FROM time_slots ts
+        JOIN work_days wd ON ts.date = wd.date
+        WHERE wd.is_open = 1
         AND ts.date >= %s AND ts.date <= %s
         ORDER BY ts.date
     """, (str(today), str(month_later)))
@@ -196,8 +223,12 @@ def cancel_booking(booking_id):
         cur.execute("UPDATE bookings SET status = 'cancelled' WHERE id = %s", (booking_id,))
         cur.execute("UPDATE time_slots SET is_booked = 0 WHERE date = %s AND time = %s", (row[0], row[1]))
         conn.commit()
+        cur.close()
+        conn.close()
+        return row[0]
     cur.close()
     conn.close()
+    return None
 
 def get_booking_by_id(booking_id):
     conn = get_db()
@@ -209,6 +240,47 @@ def get_booking_by_id(booking_id):
     if row:
         return {"id": row[0], "user_id": row[1], "date": row[2], "time": row[3], "name": row[4], "phone": row[5], "description": row[6], "contact": row[7], "status": row[8]}
     return None
+
+def add_to_waitlist(user_id, date, name, phone):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM waitlist WHERE user_id = %s AND date = %s AND status = 'waiting'", (user_id, date))
+    existing = cur.fetchone()
+    if existing:
+        cur.close()
+        conn.close()
+        return False
+    cur.execute("INSERT INTO waitlist (user_id, date, name, phone, status) VALUES (%s, %s, %s, %s, 'waiting')", (user_id, date, name, phone))
+    conn.commit()
+    cur.close()
+    conn.close()
+    return True
+
+def get_waitlist_for_date(date):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, user_id, name, phone FROM waitlist WHERE date = %s AND status = 'waiting' ORDER BY created_at", (date,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [{"id": r[0], "user_id": r[1], "name": r[2], "phone": r[3]} for r in rows]
+
+def remove_from_waitlist(waitlist_id):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("UPDATE waitlist SET status = 'notified' WHERE id = %s", (waitlist_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def get_user_waitlist(user_id):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, date FROM waitlist WHERE user_id = %s AND status = 'waiting' ORDER BY created_at", (user_id,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [{"id": r[0], "date": r[1]} for r in rows]
 
 def schedule_reminder(app, booking_id, user_id, date, time_str):
     remind_dt = datetime.strptime(date + " " + time_str, "%Y-%m-%d %H:%M") - timedelta(hours=24)
@@ -222,10 +294,47 @@ async def send_reminder(app, user_id, time_str):
     except Exception as e:
         logging.error("Reminder error: " + str(e))
 
+async def notify_waitlist(app, date, time_str):
+    waitlist = get_waitlist_for_date(date)
+    if not waitlist:
+        return
+    first = waitlist[0]
+    remove_from_waitlist(first["id"])
+    try:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Записатись", callback_data="waitlist_confirm_" + date + "_" + time_str + "_" + str(first["id"]))],
+            [InlineKeyboardButton("❌ Відмовитись", callback_data="waitlist_decline_" + str(first["id"]))],
+        ])
+        await app.bot.send_message(
+            chat_id=first["user_id"],
+            text="🎉 З'явилось вільне місце!\n\n📅 " + datetime.strptime(date, "%Y-%m-%d").strftime('%d.%m.%Y') + " о " + time_str + "\n\n⏰ У тебе є 30 хвилин щоб підтвердити запис.\nПісля цього місце перейде до наступного в черзі.",
+            reply_markup=keyboard
+        )
+        scheduler.add_job(
+            expire_waitlist_offer,
+            "date",
+            run_date=datetime.now() + timedelta(minutes=30),
+            args=[app, date, time_str, first["id"], first["user_id"]],
+            id="waitlist_expire_" + str(first["id"]),
+            replace_existing=True
+        )
+    except Exception as e:
+        logging.error("Waitlist notify error: " + str(e))
+
+async def expire_waitlist_offer(app, date, time_str, waitlist_id, user_id):
+    try:
+        await app.bot.send_message(
+            chat_id=user_id,
+            text="⏰ Час вийшов! Місце передано наступному в черзі."
+        )
+    except:
+        pass
+    await notify_waitlist(app, date, time_str)
+
 def main_menu():
     return ReplyKeyboardMarkup([
         [KeyboardButton("📅 Записатись")],
-        [KeyboardButton("📋 Мій запис")],
+        [KeyboardButton("📋 Мій запис"), KeyboardButton("🔔 Моя черга")],
         [KeyboardButton("💅 Прайси"), KeyboardButton("🖼 Портфоліо")],
     ], resize_keyboard=True)
 
@@ -260,6 +369,16 @@ def dates_keyboard(dates):
         dt = datetime.strptime(date, "%Y-%m-%d")
         day = days_ua.get(dt.strftime("%a"), dt.strftime("%a"))
         keyboard.append([InlineKeyboardButton(dt.strftime('%d.%m.%Y') + " (" + day + ")", callback_data="date_" + date)])
+    keyboard.append([InlineKeyboardButton("❌ Скасувати", callback_data="cancel_booking")])
+    return InlineKeyboardMarkup(keyboard)
+
+def dates_with_waitlist_keyboard(dates):
+    days_ua = {"Mon": "Пн", "Tue": "Вт", "Wed": "Ср", "Thu": "Чт", "Fri": "Пт", "Sat": "Сб", "Sun": "Нд"}
+    keyboard = []
+    for date in dates:
+        dt = datetime.strptime(date, "%Y-%m-%d")
+        day = days_ua.get(dt.strftime("%a"), dt.strftime("%a"))
+        keyboard.append([InlineKeyboardButton("🔔 " + dt.strftime('%d.%m.%Y') + " (" + day + ")", callback_data="waitlist_" + date)])
     keyboard.append([InlineKeyboardButton("❌ Скасувати", callback_data="cancel_booking")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -410,7 +529,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ConversationHandler.END
         dates = get_available_dates()
         if not dates:
-            await update.message.reply_text("На жаль, вільних дат немає 😔\nСпробуй пізніше.", reply_markup=main_menu())
+            all_dates = get_all_dates_with_slots()
+            if all_dates:
+                await update.message.reply_text(
+                    "😔 На жаль всі слоти зайняті.\n\n🔔 Але ти можеш стати в чергу — якщо хтось скасує запис, ми одразу повідомимо тебе!\n\nВибери день в який хочеш потрапити:",
+                    reply_markup=dates_with_waitlist_keyboard(all_dates)
+                )
+            else:
+                await update.message.reply_text("На жаль, вільних дат немає 😔\nСпробуй пізніше.", reply_markup=main_menu())
             return ConversationHandler.END
         await update.message.reply_text("📅 Вибери зручну дату:", reply_markup=dates_keyboard(dates))
 
@@ -427,6 +553,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await update.message.reply_text("У тебе немає активних записів.\n\nЗапишись через '📅 Записатись' 👇", reply_markup=main_menu())
+
+    elif text == "🔔 Моя черга":
+        waitlist = get_user_waitlist(uid)
+        if waitlist:
+            lines = []
+            for w in waitlist:
+                dt = datetime.strptime(w['date'], "%Y-%m-%d")
+                lines.append("📅 " + dt.strftime('%d.%m.%Y'))
+            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Вийти з усіх черг", callback_data="leave_all_waitlist")]])
+            await update.message.reply_text("🔔 <b>Ти в черзі на:</b>\n\n" + "\n".join(lines), parse_mode="HTML", reply_markup=keyboard)
+        else:
+            await update.message.reply_text("Ти не стоїш в жодній черзі.", reply_markup=main_menu())
 
     elif text == "💅 Прайси":
         await update.message.reply_text(get_price_text(), reply_markup=main_menu())
@@ -524,6 +662,8 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             WHERE ts.date = %s ORDER BY ts.time
         """, (date,))
         rows = cur.fetchall()
+        cur.execute("SELECT COUNT(*) FROM waitlist WHERE date = %s AND status = 'waiting'", (date,))
+        waitlist_count = cur.fetchone()[0]
         cur.close()
         conn.close()
         dt = datetime.strptime(date, "%Y-%m-%d")
@@ -534,7 +674,10 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     lines.append("🔴 " + r[0] + " — " + str(r[2]) + " | " + str(r[3]) + " (#" + str(r[4]) + ")")
                 else:
                     lines.append("🟢 " + r[0] + " — вільно")
-            await query.edit_message_text("📅 <b>Розклад на " + dt.strftime('%d.%m.%Y') + ":</b>\n\n" + "\n".join(lines), parse_mode="HTML")
+            text = "📅 <b>Розклад на " + dt.strftime('%d.%m.%Y') + ":</b>\n\n" + "\n".join(lines)
+            if waitlist_count > 0:
+                text += "\n\n🔔 В черзі: " + str(waitlist_count) + " чол."
+            await query.edit_message_text(text, parse_mode="HTML")
         else:
             await query.edit_message_text("Слотів на " + dt.strftime('%d.%m.%Y') + " немає.")
 
@@ -555,12 +698,119 @@ async def booking_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.edit_message_text("Вільних дат немає 😔")
 
+    elif data.startswith("waitlist_confirm_"):
+        parts = data.replace("waitlist_confirm_", "").split("_")
+        date = parts[0]
+        time_str = parts[1]
+        waitlist_id = parts[2]
+
+        job_id = "waitlist_expire_" + waitlist_id
+        if scheduler.get_job(job_id):
+            scheduler.remove_job(job_id)
+
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT is_booked FROM time_slots WHERE date = %s AND time = %s", (date, time_str))
+        slot = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        if not slot or slot[0]:
+            await query.edit_message_text("❌ На жаль цей слот вже зайнятий.\n\nМи повідомимо тебе якщо з'явиться інший! 😔")
+            await notify_waitlist(context.application, date, time_str)
+            return
+
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT name, phone FROM waitlist WHERE id = %s", (int(waitlist_id),))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        if row:
+            context.user_data["booking_date"] = date
+            context.user_data["booking_time"] = time_str
+            context.user_data["booking_name"] = row[0]
+            context.user_data["booking_phone"] = row[1]
+            context.user_data["booking_desc"] = "з черги очікування"
+            context.user_data["booking_photos"] = []
+            context.user_data["booking_contact"] = None
+
+            booking_id = create_booking(uid, date, time_str, row[0], row[1], "з черги очікування", None, [])
+            dt = datetime.strptime(date + " " + time_str, "%Y-%m-%d %H:%M")
+            schedule_reminder(context.application, booking_id, uid, date, time_str)
+            context.user_data.clear()
+
+            await query.edit_message_text(
+                "✅ <b>Запис підтверджено!</b>\n\n📅 " + dt.strftime('%d.%m.%Y') + "\n🕐 " + time_str + "\n\nЧекаємо на тебе! ❤️",
+                parse_mode="HTML"
+            )
+
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text="🆕 <b>Новий запис з черги!</b>\n\n#" + str(booking_id) + " | " + dt.strftime('%d.%m.%Y') + " о " + time_str + "\n👤 " + row[0] + "\n📞 " + row[1],
+                    parse_mode="HTML"
+                )
+            except:
+                pass
+
+    elif data.startswith("waitlist_decline_"):
+        waitlist_id = data.replace("waitlist_decline_", "")
+        job_id = "waitlist_expire_" + waitlist_id
+        if scheduler.get_job(job_id):
+            scheduler.remove_job(job_id)
+        await query.edit_message_text("Зрозуміло! Якщо передумаєш — запишись знову 😊")
+
+    elif data == "leave_all_waitlist":
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("UPDATE waitlist SET status = 'cancelled' WHERE user_id = %s AND status = 'waiting'", (uid,))
+        conn.commit()
+        cur.close()
+        conn.close()
+        await query.edit_message_text("✅ Ти вийшов з усіх черг.")
+
+    elif data.startswith("waitlist_"):
+        date = data.replace("waitlist_", "")
+        existing = get_user_booking(uid)
+        if existing:
+            await query.edit_message_text("❌ У тебе вже є активний запис. Спочатку скасуй його.")
+            return
+
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT name, phone FROM bookings WHERE user_id = %s ORDER BY created_at DESC LIMIT 1", (uid,))
+        last = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        name = last[0] if last else "Клієнт"
+        phone = last[1] if last else "—"
+
+        added = add_to_waitlist(uid, date, name, phone)
+        dt = datetime.strptime(date, "%Y-%m-%d")
+
+        if added:
+            await query.edit_message_text(
+                "✅ Тебе додано в чергу на " + dt.strftime('%d.%m.%Y') + "!\n\n🔔 Як тільки з'явиться вільний час — ми одразу напишемо тобі.\nУ тебе буде 30 хвилин щоб підтвердити запис."
+            )
+        else:
+            await query.edit_message_text("Ти вже в черзі на цей день! 😊")
+
     elif data.startswith("date_"):
         date = data.replace("date_", "")
         context.user_data["booking_date"] = date
         times = get_available_times(date)
         if not times:
-            await query.edit_message_text("На цю дату немає вільних слотів 😔\nВибери іншу дату:", reply_markup=dates_keyboard(get_available_dates()))
+            all_dates = get_all_dates_with_slots()
+            await query.edit_message_text(
+                "😔 На цю дату всі слоти зайняті.\n\n🔔 Стань в чергу — якщо хтось скасує запис, ми одразу повідомимо тебе!",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔔 Стати в чергу на цей день", callback_data="waitlist_" + date)],
+                    [InlineKeyboardButton("◀️ Вибрати інший день", callback_data="back_to_dates")],
+                ])
+            )
             return
         dt = datetime.strptime(date, "%Y-%m-%d")
         days_ua = {"Mon": "Пн", "Tue": "Вт", "Wed": "Ср", "Thu": "Чт", "Fri": "Пт", "Sat": "Сб", "Sun": "Нд"}
@@ -600,11 +850,16 @@ async def booking_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if row:
             booking = {"id": row[0], "user_id": row[1], "date": row[2], "time": row[3], "name": row[4], "phone": row[5], "description": row[6], "contact": row[7]}
-            cancel_booking(booking_id)
+            freed_date = cancel_booking(booking_id)
             job_id = "reminder_" + str(booking_id)
             if scheduler.get_job(job_id):
                 scheduler.remove_job(job_id)
             await query.edit_message_text("✅ Запис скасовано.\n\nБудемо раді бачити тебе знову! 😊")
+
+            times = get_available_times(booking['date'])
+            if times and freed_date:
+                await notify_waitlist(context.application, freed_date, booking['time'])
+
             try:
                 dt = datetime.strptime(booking['date'] + " " + booking['time'], "%Y-%m-%d %H:%M")
                 desc = booking['description'] or "—"
@@ -738,10 +993,13 @@ async def admin_cancel_booking(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text("❌ Запис не знайдено або вже скасований.", reply_markup=admin_menu())
             return ConversationHandler.END
 
-        cancel_booking(booking_id)
+        freed_date = cancel_booking(booking_id)
         job_id = "reminder_" + str(booking_id)
         if scheduler.get_job(job_id):
             scheduler.remove_job(job_id)
+
+        if freed_date:
+            await notify_waitlist(context.application, freed_date, booking['time'])
 
         try:
             await context.bot.send_message(
