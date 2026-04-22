@@ -363,7 +363,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rows = cur.fetchall()
             conn.close()
             if rows:
-                lines = [f"#{r['id']} | {datetime.strptime(f\"{r['date']} {r['time']}\", '%Y-%m-%d %H:%M').strftime('%d.%m %H:%M')} | {r['name']} | {r['phone']}" for r in rows]
+                lines = []
+                for r in rows:
+                    dt_str = f"{r['date']} {r['time']}"
+                    dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M").strftime('%d.%m %H:%M')
+                    lines.append(f"#{r['id']} | {dt} | {r['name']} | {r['phone']}")
                 await update.message.reply_text("📋 <b>Майбутні записи:</b>\n\n" + "\n".join(lines) + "\n\n💡 ID використовуй для скасування", parse_mode="HTML", reply_markup=admin_menu())
             else:
                 await update.message.reply_text("Активних записів немає.", reply_markup=admin_menu())
